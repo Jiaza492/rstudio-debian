@@ -1,43 +1,51 @@
+FROM ubuntu:18.04 as base
+
+### Stage 1 - add/remove packages ###
+
+# Ensure scripts are available for use in next command
+COPY ./container/root/scripts/* /scripts/
+
+# - Symlink variant-specific scripts to default location
+# - Upgrade base security packages, then clean packaging leftover
+# - Add S6 for zombie reaping, boot-time coordination, signal transformation/distribution: @see https://github.com/just-containers/s6-overlay#known-issues-and-workarounds
+# - Add goss for local, serverspec-like testing
+RUN /bin/bash -e /scripts/ubuntu_apt_cleanmode.sh && \
+    ln -s /scripts/clean_ubuntu.sh /clean.sh && \
+    ln -s /scripts/security_updates_ubuntu.sh /security_updates.sh && \
+    echo 'debconf debconf/frontend select Noninteractive' | debconf-set-selections && \
+    /bin/bash -e /security_updates.sh && \
+    apt-get install -yqq \
+      curl \
+      gpg \
+    && \
+    /bin/bash -e /scripts/install_s6.sh && \
+    /bin/bash -e /scripts/install_goss.sh && \
+    apt-get remove --purge -yq \
+        curl \
+        gpg \
+    && \
+    /bin/bash -e /clean.sh && \
+    # out of order execution, has a dpkg error if performed before the clean script, so keeping it here,
+    apt-get remove --purge --auto-remove systemd --allow-remove-essential -y
+
+# Overlay the root filesystem from this repo
+COPY ./container/root /
+
+
+### Stage 2 --- collapse layers ###
+
 FROM scratch
-ADD ubuntu-bionic-core-cloudimg-amd64-root.tar.gz /
-# verify that the APT lists files do not exist
-RUN [ -z "$(apt-get indextargets)" ]
-# (see https://bugs.launchpad.net/cloud-images/+bug/1699913)
+COPY --from=base / .
 
-# a few minor docker-specific tweaks
-# see https://github.com/docker/docker/blob/9a9fc01af8fb5d98b8eec0740716226fadb3735c/contrib/mkimage/debootstrap
-RUN set -xe \
-	\
-# https://github.com/docker/docker/blob/9a9fc01af8fb5d98b8eec0740716226fadb3735c/contrib/mkimage/debootstrap#L40-L48
-	&& echo '#!/bin/sh' > /usr/sbin/policy-rc.d \
-	&& echo 'exit 101' >> /usr/sbin/policy-rc.d \
-	&& chmod +x /usr/sbin/policy-rc.d \
-	\
-# https://github.com/docker/docker/blob/9a9fc01af8fb5d98b8eec0740716226fadb3735c/contrib/mkimage/debootstrap#L54-L56
-	&& dpkg-divert --local --rename --add /sbin/initctl \
-	&& cp -a /usr/sbin/policy-rc.d /sbin/initctl \
-	&& sed -i 's/^exit.*/exit 0/' /sbin/initctl \
-	\
-# https://github.com/docker/docker/blob/9a9fc01af8fb5d98b8eec0740716226fadb3735c/contrib/mkimage/debootstrap#L71-L78
-	&& echo 'force-unsafe-io' > /etc/dpkg/dpkg.cfg.d/docker-apt-speedup \
-	\
-# https://github.com/docker/docker/blob/9a9fc01af8fb5d98b8eec0740716226fadb3735c/contrib/mkimage/debootstrap#L85-L105
-	&& echo 'DPkg::Post-Invoke { "rm -f /var/cache/apt/archives/*.deb /var/cache/apt/archives/partial/*.deb /var/cache/apt/*.bin || true"; };' > /etc/apt/apt.conf.d/docker-clean \
-	&& echo 'APT::Update::Post-Invoke { "rm -f /var/cache/apt/archives/*.deb /var/cache/apt/archives/partial/*.deb /var/cache/apt/*.bin || true"; };' >> /etc/apt/apt.conf.d/docker-clean \
-	&& echo 'Dir::Cache::pkgcache ""; Dir::Cache::srcpkgcache "";' >> /etc/apt/apt.conf.d/docker-clean \
-	\
-# https://github.com/docker/docker/blob/9a9fc01af8fb5d98b8eec0740716226fadb3735c/contrib/mkimage/debootstrap#L109-L115
-	&& echo 'Acquire::Languages "none";' > /etc/apt/apt.conf.d/docker-no-languages \
-	\
-# https://github.com/docker/docker/blob/9a9fc01af8fb5d98b8eec0740716226fadb3735c/contrib/mkimage/debootstrap#L118-L130
-	&& echo 'Acquire::GzipIndexes "true"; Acquire::CompressionTypes::Order:: "gz";' > /etc/apt/apt.conf.d/docker-gzip-indexes \
-	\
-# https://github.com/docker/docker/blob/9a9fc01af8fb5d98b8eec0740716226fadb3735c/contrib/mkimage/debootstrap#L134-L151
-	&& echo 'Apt::AutoRemove::SuggestsImportant "false";' > /etc/apt/apt.conf.d/docker-autoremove-suggests
+# Use in multi-phase builds, when an init process requests for the container to gracefully exit, so that it may be committed
+# Used with alternative CMD (worker.sh), leverages supervisor to maintain long-running processes
+ENV SIGNAL_BUILD_STOP=99 \
+    S6_BEHAVIOUR_IF_STAGE2_FAILS=2 \
+    S6_KILL_FINISH_MAXTIME=5000 \
+    S6_KILL_GRACETIME=3000
 
-# make systemd-detect-virt return "docker"
-# See: https://github.com/systemd/systemd/blob/aa0c34279ee40bce2f9681b496922dedbadfca19/src/basic/virt.c#L434
-RUN mkdir -p /run/systemd && echo 'docker' > /run/systemd/container
+RUN goss -g goss.base.yaml validate
 
-# overwrite this with 'CMD []' in a dependent Dockerfile
-CMD ["/bin/bash"]
+# NOTE: intentionally NOT using s6 init as the entrypoint
+# This would prevent container debugging if any of those service crash
+CMD ["/bin/bash", "/run.sh"]
